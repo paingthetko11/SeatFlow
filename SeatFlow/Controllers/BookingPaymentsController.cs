@@ -11,7 +11,8 @@ namespace SeatFlow.Controllers;
 [Route("api/bookings/{bookingId:guid}/payment")]
 public sealed class BookingPaymentsController(
     SeatFlowDbContext dbContext,
-    ExpiredHoldCleanup expiredHoldCleanup) : ControllerBase
+    ExpiredHoldCleanup expiredHoldCleanup,
+    RedisSeatLockService redisSeatLockService) : ControllerBase
 {
     [HttpPost]
     [ProducesResponseType(typeof(PaymentSimulationResponse), StatusCodes.Status200OK)]
@@ -150,6 +151,7 @@ public sealed class BookingPaymentsController(
             dbContext.Payments.Add(payment);
             await dbContext.SaveChangesAsync(cancellationToken);
             await transaction.CommitAsync(cancellationToken);
+            await redisSeatLockService.ReleaseManyAsync(booking.ShowId, seatIds, bookingId);
 
             return Ok(ToResponse(payment));
         }
