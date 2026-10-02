@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "dgSpecHash": "Tvxb7TTWrAY=",
+  "success": true,
+  "projectFilePath": "C:\\Users\\PTK\\source\\repos\\SeatFlow\\SeatFlow\\SeatFlow.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\PTK\\.nuget\\packages\\microsoft.aspnetcore.openapi\\10.0.12\\microsoft.aspnetcore.openapi.10.0.12.nupkg.sha512",
+    "C:\\Users\\PTK\\.nuget\\packages\\microsoft.openapi\\2.12.0\\microsoft.openapi.2.12.0.nupkg.sha512"
+  ],
+  "logs": []
+}
