@@ -1,0 +1,13 @@
+# Visual Studio user and cache files
+.vs/
+*.user
+*.suo
+
+# .NET build output
+**/bin/
+**/obj/
+
+# IDE and local environment files
+.idea/
+*.userosscache
+*.sln.docstates
