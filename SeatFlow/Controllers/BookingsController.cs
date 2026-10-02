@@ -16,6 +16,115 @@ public sealed class BookingsController(
     private static readonly TimeSpan HoldDuration = TimeSpan.FromMinutes(5);
     private const int MaximumSeatsPerBooking = 10;
 
+    [HttpGet("{bookingId:guid}")]
+    [ProducesResponseType(typeof(BookingDetailsResponse), StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<ActionResult<BookingDetailsResponse>> GetBooking(
+        Guid bookingId,
+        CancellationToken cancellationToken)
+    {
+        var booking = await dbContext.Bookings
+            .AsNoTracking()
+            .Where(x => x.BookingId == bookingId)
+            .Select(x => new BookingDetailsResponse(
+                x.BookingId,
+                x.CustomerId,
+                x.ShowId,
+                x.Status,
+                x.TotalAmount,
+                x.Currency,
+                x.HoldExpiresAtUtc,
+                x.CreatedAtUtc,
+                x.UpdatedAtUtc,
+                x.BookingSeats
+                    .OrderBy(seat => seat.SeatId)
+                    .Select(seat => new BookingHoldSeatResponse(
+                        seat.SeatId,
+                        seat.ShowSeat.Seat.Section,
+                        seat.ShowSeat.Seat.RowLabel,
+                        seat.ShowSeat.Seat.SeatNumber,
+                        seat.PriceAtBooking))
+                    .ToList(),
+                x.Payments
+                    .OrderByDescending(payment => payment.CreatedAtUtc)
+                    .Select(payment => new BookingPaymentResponse(
+                        payment.PaymentId,
+                        payment.Status,
+                        payment.Amount,
+                        payment.Currency,
+                        payment.Provider,
+                        payment.CreatedAtUtc))
+                    .ToList()))
+            .SingleOrDefaultAsync(cancellationToken);
+
+        return booking is null ? NotFound() : Ok(booking);
+    }
+
+    [HttpPost("{bookingId:guid}/cancel")]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status409Conflict)]
+    public async Task<IActionResult> CancelBooking(Guid bookingId, CancellationToken cancellationToken)
+    {
+        await CleanupExpiredHoldsAsync(cancellationToken);
+
+        await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
+
+        var now = DateTime.UtcNow;
+        var updatedBookings = await dbContext.Bookings
+            .Where(x => x.BookingId == bookingId && x.Status == "Pending" && x.HoldExpiresAtUtc > now)
+            .ExecuteUpdateAsync(update => update
+                .SetProperty(x => x.Status, "Cancelled")
+                .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
+
+        if (updatedBookings == 0)
+        {
+            var currentStatus = await dbContext.Bookings
+                .AsNoTracking()
+                .Where(x => x.BookingId == bookingId)
+                .Select(x => x.Status)
+                .SingleOrDefaultAsync(cancellationToken);
+
+            await transaction.RollbackAsync(cancellationToken);
+
+            if (currentStatus is null)
+            {
+                return NotFound();
+            }
+
+            if (currentStatus == "Cancelled")
+            {
+                return NoContent();
+            }
+
+            return Conflict(new { message = $"Booking cannot be cancelled from status '{currentStatus}'." });
+        }
+
+        var bookingSeats = await dbContext.BookingSeats
+            .AsNoTracking()
+            .Where(x => x.BookingId == bookingId)
+            .Select(x => new { x.ShowId, x.SeatId })
+            .ToListAsync(cancellationToken);
+
+        foreach (var seat in bookingSeats)
+        {
+            await dbContext.ShowSeats
+                .Where(x => x.ShowId == seat.ShowId
+                    && x.SeatId == seat.SeatId
+                    && x.Status == "Held"
+                    && x.HoldToken == bookingId)
+                .ExecuteUpdateAsync(update => update
+                    .SetProperty(x => x.Status, "Available")
+                    .SetProperty(x => x.HoldToken, (Guid?)null)
+                    .SetProperty(x => x.HoldExpiresAtUtc, (DateTime?)null)
+                    .SetProperty(x => x.BookingId, (Guid?)null)
+                    .SetProperty(x => x.UpdatedAtUtc, now), cancellationToken);
+        }
+
+        await transaction.CommitAsync(cancellationToken);
+        return NoContent();
+    }
+
     [HttpPost("hold")]
     [ProducesResponseType(typeof(BookingHoldResponse), StatusCodes.Status201Created)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
@@ -49,6 +158,8 @@ public sealed class BookingsController(
             return BadRequest(new { message = "The Idempotency-Key header must contain 1 to 100 characters." });
         }
 
+        await CleanupExpiredHoldsAsync(cancellationToken);
+
         var existingBooking = await FindByIdempotencyKeyAsync(customerId, idempotencyKey, cancellationToken);
         if (existingBooking is not null)
         {
@@ -64,8 +175,6 @@ public sealed class BookingsController(
         await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
         try
         {
-            await expiredHoldCleanup.CleanupAsync(cancellationToken);
-
             var showExists = await dbContext.Shows
                 .AsNoTracking()
                 .AnyAsync(x => x.ShowId == request.ShowId, cancellationToken);
@@ -172,6 +281,13 @@ public sealed class BookingsController(
                 x => x.CustomerId == customerId && x.IdempotencyKey == idempotencyKey,
                 cancellationToken);
 
+    private async Task CleanupExpiredHoldsAsync(CancellationToken cancellationToken)
+    {
+        await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
+        await expiredHoldCleanup.CleanupAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
     private async Task<bool> MatchesRequestAsync(
         Booking booking,
         int showId,
@@ -249,4 +365,25 @@ public sealed record BookingHoldResponse(
     decimal TotalAmount,
     string Currency,
     DateTime HoldExpiresAtUtc,
+    DateTime CreatedAtUtc);
+
+public sealed record BookingDetailsResponse(
+    Guid BookingId,
+    string CustomerId,
+    int ShowId,
+    string Status,
+    decimal TotalAmount,
+    string Currency,
+    DateTime HoldExpiresAtUtc,
+    DateTime CreatedAtUtc,
+    DateTime UpdatedAtUtc,
+    IReadOnlyList<BookingHoldSeatResponse> Seats,
+    IReadOnlyList<BookingPaymentResponse> Payments);
+
+public sealed record BookingPaymentResponse(
+    Guid PaymentId,
+    string Status,
+    decimal Amount,
+    string Currency,
+    string Provider,
     DateTime CreatedAtUtc);
