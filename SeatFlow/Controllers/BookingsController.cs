@@ -4,6 +4,7 @@ using Microsoft.EntityFrameworkCore;
 using SeatFlow.Data;
 using SeatFlow.Entities;
 using SeatFlow.Services;
+using StackExchange.Redis;
 
 namespace SeatFlow.Controllers;
 
@@ -11,7 +12,8 @@ namespace SeatFlow.Controllers;
 [Route("api/bookings")]
 public sealed class BookingsController(
     SeatFlowDbContext dbContext,
-    ExpiredHoldCleanup expiredHoldCleanup) : ControllerBase
+    ExpiredHoldCleanup expiredHoldCleanup,
+    RedisSeatLockService redisSeatLockService) : ControllerBase
 {
     private static readonly TimeSpan HoldDuration = TimeSpan.FromMinutes(5);
     private const int MaximumSeatsPerBooking = 10;
@@ -122,6 +124,14 @@ public sealed class BookingsController(
         }
 
         await transaction.CommitAsync(cancellationToken);
+        foreach (var group in bookingSeats.GroupBy(x => x.ShowId))
+        {
+            await redisSeatLockService.ReleaseManyAsync(
+                group.Key,
+                group.Select(x => x.SeatId),
+                bookingId);
+        }
+
         return NoContent();
     }
 
@@ -173,8 +183,37 @@ public sealed class BookingsController(
         var holdExpiresAtUtc = now.Add(HoldDuration);
 
         await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
+        IReadOnlyList<int> acquiredSeatIds = [];
+        var databaseCommitted = false;
         try
         {
+            RedisSeatLockResult lockResult;
+            try
+            {
+                lockResult = await redisSeatLockService.TryAcquireManyAsync(
+                    request.ShowId,
+                    seatIds,
+                    bookingId,
+                    holdExpiresAtUtc,
+                    cancellationToken);
+            }
+            catch (RedisException)
+            {
+                await transaction.RollbackAsync(cancellationToken);
+                return StatusCode(StatusCodes.Status503ServiceUnavailable, new
+                {
+                    message = "The seat locking service is unavailable. Try again shortly."
+                });
+            }
+
+            if (!lockResult.Acquired)
+            {
+                await transaction.RollbackAsync(cancellationToken);
+                return Conflict(new { message = $"Seat {lockResult.ContendedSeatId} is being held by another request." });
+            }
+
+            acquiredSeatIds = lockResult.AcquiredSeatIds;
+
             var showExists = await dbContext.Shows
                 .AsNoTracking()
                 .AnyAsync(x => x.ShowId == request.ShowId, cancellationToken);
@@ -250,6 +289,7 @@ public sealed class BookingsController(
 
             await dbContext.SaveChangesAsync(cancellationToken);
             await transaction.CommitAsync(cancellationToken);
+            databaseCommitted = true;
 
             var response = await ToResponseAsync(booking, cancellationToken);
             return StatusCode(StatusCodes.Status201Created, response);
@@ -268,6 +308,13 @@ public sealed class BookingsController(
             }
 
             throw;
+        }
+        finally
+        {
+            if (!databaseCommitted && acquiredSeatIds.Count > 0)
+            {
+                await redisSeatLockService.ReleaseManyAsync(request.ShowId, acquiredSeatIds, bookingId);
+            }
         }
     }
 
